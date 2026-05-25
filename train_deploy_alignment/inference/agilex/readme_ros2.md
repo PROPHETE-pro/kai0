@@ -15,13 +15,11 @@ Shared topics (policy server on GPU host, IPC Python env, prompts, AWBC, inferen
 | `roslaunch realsense2_camera multi_camera.launch` | `ros2 launch realsense2_camera ...` (see [RealSense (ROS 2)](#3-realsense-cameras-ros-2) below) |
 | `Piper_ros_private-ros-noetic` | `piper_ros_humble` |
 | `PKG_ROOT` | `PIPER_ROS2_ROOT` → path to `piper_ros_humble` |
+| `agilex_inference_openpi_temporal_smoothing.py` (`rospy`) | [`agilex_inference_openpi_temporal_smoothing_ros2.py`](inference/agilex_inference_openpi_temporal_smoothing_ros2.py) (`rclpy`) |
 
-**Important:** Inference scripts under `inference/` still use **`rospy` (ROS 1)**. For end-to-end OpenPi inference you must either:
+**Recommended:** Use the native ROS 2 inference script [`agilex_inference_openpi_temporal_smoothing_ros2.py`](inference/agilex_inference_openpi_temporal_smoothing_ros2.py). It talks directly to `start_two_piper.launch.py` topics (no `ros1_bridge`).
 
-1. Run a **ROS 1 ↔ ROS 2 bridge** (`ros1_bridge` or `ros1_bridge` dynamic bridge) with the topic mapping in [Inference topics (ROS 2 ↔ scripts)](#inference-topics-ros-2--scripts), **or**
-2. Port the inference nodes to `rclpy` (not covered here).
-
-The steps below bring up the **robot stack on ROS 2**. Step 5 describes running the existing inference client with bridging or adjusted launch order.
+**Legacy:** The original scripts under `inference/` still use **`rospy` (ROS 1)**. If you keep them, you need **ROS Noetic + `ros1_bridge`** — see [Legacy: ROS 1 inference + bridge](#legacy-ros-1-inference--bridge) below.
 
 ---
 
@@ -50,6 +48,13 @@ sudo apt install -y can-utils ethtool iproute2
 
 # RealSense ROS 2 driver
 sudo apt install -y ros-humble-realsense2-camera
+
+# Inference client (rclpy + image conversion)
+sudo apt install -y \
+  ros-humble-cv-bridge \
+  ros-humble-sensor-msgs \
+  ros-humble-geometry-msgs \
+  ros-humble-nav-msgs
 ```
 
 Add to `~/.bashrc` or `~/.zshrc` (use **one** ROS distro per shell — do not mix Noetic and Humble in the same terminal):
@@ -102,7 +107,7 @@ Unchanged from [README.md — Inference Setup](README.md#inference-setup):
 1. **GPU host:** `uv run scripts/serve_policy.py ...`  
 2. **IPC:** Start the ROS 2 robot stack below, then run the inference script with `--host <gpu_host_ip> --port 8000`.
 
-Set **`lang_embeddings`** in the inference script as in [Prompt and AWBC](README.md#prompt-and-awbc-important).
+Set **`lang_embeddings`** in the inference script (ROS 2: `agilex_inference_openpi_temporal_smoothing_ros2.py`) as in [Prompt and AWBC](README.md#prompt-and-awbc-important).
 
 ---
 
@@ -118,7 +123,7 @@ Flow **on the IPC** after the policy server is running on the GPU host. Replace 
 - `PIPER_ROS2_ROOT` set; workspace sourced: `source "$PIPER_ROS2_ROOT/install/setup.bash"`.  
 - Policy server IP and port (default `8000`).  
 - Optional: **tmux** for multi-pane layout.  
-- For inference with existing scripts: **ROS Noetic** available for `rospy` + **`ros1_bridge`** (see step 5).
+- For inference: **only Humble** in the inference terminal (do not source Noetic in the same shell).
 
 ### Environment (every terminal)
 
@@ -178,13 +183,13 @@ ROS 1 used:
 roslaunch realsense2_camera multi_camera.launch
 ```
 
-On ROS 2, use **`ros-humble-realsense2-camera`**. Inference defaults expect these image topics (see script defaults):
+On ROS 2, use **`ros-humble-realsense2-camera`**. When both `camera_name` and `camera_namespace` are set to the same value (as below), RealSense publishes under **`/<ns>/<ns>/color/image_raw`** (namespace appears twice). The ROS 2 inference script defaults match that layout:
 
 | Camera | Color topic |
 |---|---|
-| Front | `/camera_f/color/image_raw` |
-| Left wrist | `/camera_l/color/image_raw` |
-| Right wrist | `/camera_r/color/image_raw` |
+| Front | `/camera_f/camera_f/color/image_raw` |
+| Left wrist | `/camera_l/camera_l/color/image_raw` |
+| Right wrist | `/camera_r/camera_r/color/image_raw` |
 
 **Option A — three launches (one serial per terminal)**  
 Replace `<SERIAL>` with each device serial from `rs-enumerate-devices`:
@@ -203,13 +208,18 @@ ros2 launch realsense2_camera rs_launch.py \
   camera_name:=camera_r camera_namespace:=camera_r serial_no:=<SERIAL_R>
 ```
 
-**Option B — custom multi-camera launch**  
-If you already have a ROS 2 `multi_camera` launch (ported from Noetic), run it with `ros2 launch` and ensure namespaces match the table above.
+**Option B — shorter topic names**  
+To get `/camera_l/color/image_raw` (single namespace), use a different `camera_name`, e.g. `camera_name:=cam camera_namespace:=camera_l`. Then override inference CLI: `--img_left_topic /camera_l/cam/color/image_raw`.
+
+**Option C — custom multi-camera launch**  
+If you already have a ROS 2 `multi_camera` launch, ensure topic names match the script defaults or pass `--img_*_topic` flags.
 
 Verify:
 
 ```bash
-ros2 topic list | grep -E 'camera_[flr]/color'
+ros2 topic hz /camera_f/camera_f/color/image_raw
+ros2 topic hz /camera_l/camera_l/color/image_raw
+ros2 topic hz /camera_r/camera_r/color/image_raw
 ```
 
 ---
@@ -244,67 +254,122 @@ ros2 topic list | grep -E 'joint_(left|right)|joint_ctrl_cmd'
 
 ---
 
-#### 5. Inference node
+#### 5. Inference node (ROS 2 / rclpy)
 
-From repo root (or directory containing `inference/`), with `kai0_inference` active:
+In the **same terminal** as step 1, source Humble + `piper_ros_humble`, then run the ROS 2 client.
+
+**Important:** Source ROS 2 *after* `conda activate`. If you only activate conda and run Python, you may get `_TYPE_SUPPORT` / ROS 1 message errors.
 
 ```bash
 conda activate kai0_inference
-python train_deploy_alignment/inference/agilex/inference/agilex_inference_openpi_temporal_smoothing.py \
+source /opt/ros/humble/setup.bash
+source "$PIPER_ROS2_ROOT/install/setup.bash"
+
+python train_deploy_alignment/inference/agilex/inference/agilex_inference_openpi_temporal_smoothing_ros2.py \
   --host <gpu_host_ip> --port 8000 \
   --ctrl_type joint --use_temporal_smoothing --chunk_size 50
 ```
 
-Other scripts: see [Inference scripts](README.md#inference-scripts) in README.md.
+Or use the wrapper (sources Humble + workspace for you):
 
-##### Inference topics (ROS 2 ↔ scripts)
+```bash
+conda activate kai0_inference
+bash train_deploy_alignment/inference/agilex/inference/run_inference_ros2.sh \
+  --host <gpu_host_ip> --port 8000 \
+  --ctrl_type joint --use_temporal_smoothing --chunk_size 50
+```
 
-Scripts default to **ROS 1** names (`rospy`). With **`start_two_piper.launch.py`**, the natural ROS 2 names are:
+The script will move the arms to a home pose, then wait for **Enter** before connecting to the policy server and starting closed-loop control.
 
-| Role | ROS 1 default (script) | ROS 2 (`start_two_piper`) |
+##### Dry run: verify commands without moving the robot
+
+Use this when the workspace is cluttered or you want to test the full pipeline (cameras + policy + command generation) **without** driving the real arms.
+
+**Do not** run `start_two_piper.launch.py` in this mode (or Piper will still enable if launched). Instead:
+
+| Terminal | Command |
+|---|---|
+| A | Three RealSense launches (as in step 3) |
+| B | `python .../mock_arm_feedback_ros2.py` — fake `/joint_left`, `/joint_right` |
+| C | `ros2 topic echo /joint_ctrl_cmd_left_dry` (optional monitor) |
+| D | Inference with `--dry_run` |
+
+```bash
+# Terminal B — mock proprio (no CAN / no Piper)
+source /opt/ros/humble/setup.bash
+python train_deploy_alignment/inference/agilex/inference/mock_arm_feedback_ros2.py
+
+# Terminal C — watch commands (optional; start AFTER dry-run inference is running)
+ros2 topic list -t | grep dry
+ros2 topic hz /joint_ctrl_cmd_left_dry
+ros2 topic echo /joint_ctrl_cmd_left_dry
+# If echo asks for a type before any publisher exists, use one of:
+#   ros2 topic echo /joint_ctrl_cmd_left_dry sensor_msgs/JointState
+#   ros2 topic echo /joint_ctrl_cmd_left_dry sensor_msgs/msg/JointState
+
+# Terminal D — inference dry run
+source /opt/ros/humble/setup.bash
+conda activate kai0_inference
+python train_deploy_alignment/inference/agilex/inference/agilex_inference_openpi_temporal_smoothing_ros2.py \
+  --host <gpu_host_ip> --port 8000 \
+  --ctrl_type joint --use_temporal_smoothing --chunk_size 50 \
+  --dry_run --max_publish_step 200 \
+  --dry_run_log_file /tmp/piper_dry_run.log
+```
+
+What `--dry_run` does:
+
+- Skips homing (no move to `left0` / `right0`).
+- Publishes commands on **`/joint_ctrl_cmd_left_dry`** and **`/joint_ctrl_cmd_right_dry`** only — Piper subscribes to `/joint_ctrl_cmd_*` without `_dry`, so **nothing moves**.
+- Prints each command to the console; optional `--dry_run_log_file` saves them.
+
+If Piper is already running and you only want to block motion, `--dry_run` is still safe: commands never reach the Piper nodes.
+
+**Pre-flight checks** (with cameras + Piper already running):
+
+```bash
+ros2 topic hz /camera_f/camera_f/color/image_raw
+ros2 topic hz /camera_l/camera_l/color/image_raw
+ros2 topic hz /camera_r/camera_r/color/image_raw
+ros2 topic hz /joint_left
+ros2 topic hz /joint_right
+```
+
+Other OpenPi scripts (`*_rtc.py`, `*_sync.py`, etc.) are still ROS 1 only; port them the same way or use the bridge path below.
+
+##### Inference topics (`start_two_piper` ↔ ROS 2 script)
+
+The ROS 2 script defaults match `start_two_piper.launch.py`:
+
+| Role | Topic |
+|---|---|
+| Arm state (subscribe) | `/joint_left`, `/joint_right` |
+| Arm command (publish) | `/joint_ctrl_cmd_left`, `/joint_ctrl_cmd_right` |
+| End-effector cmd | `/pos_cmd_left`, `/pos_cmd_right` |
+| Front / left / right color | `/camera_f/camera_f/color/image_raw`, `/camera_l/camera_l/color/image_raw`, `/camera_r/camera_r/color/image_raw` |
+
+Override with CLI flags if your namespaces differ, e.g. `--img_front_topic`, `--puppet_arm_left_topic`.
+
+**Joint command names:** The ROS 2 Piper node expects `JointState.name` = `joint1`…`joint6`, `gripper` (not ROS 1 `joint0`…`joint6`). The `_ros2.py` script sets these automatically.
+
+##### Legacy: ROS 1 inference + bridge
+
+Only if you still run `agilex_inference_openpi_temporal_smoothing.py` (`rospy`):
+
+| Role | ROS 1 default | ROS 2 (`start_two_piper`) |
 |---|---|---|
-| Arm state (subscribe) | `/puppet/joint_left`, `/puppet/joint_right` | `/joint_left`, `/joint_right` |
-| Arm command (publish) | `/master/joint_left`, `/master/joint_right` | `/joint_ctrl_cmd_left`, `/joint_ctrl_cmd_right` |
-| End-effector cmd | `/pos_cmd_left`, `/pos_cmd_right` | `/pos_cmd_left`, `/pos_cmd_right` |
+| Arm state | `/puppet/joint_left`, `/puppet/joint_right` | `/joint_left`, `/joint_right` |
+| Arm command | `/master/joint_left`, `/master/joint_right` | `/joint_ctrl_cmd_left`, `/joint_ctrl_cmd_right` |
 
-**A. `ros1_bridge` (recommended with current scripts)**  
-
-Terminal with **Noetic** + bridge (example static bridge config — adjust if your bridge version differs):
+Bridge example (separate terminal; requires Noetic + `ros1_bridge`):
 
 ```bash
 source /opt/ros/noetic/setup.bash
 source /opt/ros/humble/setup.bash
-
-# Example: bridge puppet/master names to ROS 2 arm topics
-ros2 run ros1_bridge dynamic_bridge \
-  --bridge-all-topics
+ros2 run ros1_bridge dynamic_bridge --bridge-all-topics
 ```
 
-Or use a YAML bridge mapping `/puppet/joint_left` ↔ `/joint_left`, `/master/joint_left` ↔ `/joint_ctrl_cmd_left`, etc.
-
-Run inference in a terminal with **Noetic** sourced (for `rospy`):
-
-```bash
-source /opt/ros/noetic/setup.bash
-conda activate kai0_inference
-python train_deploy_alignment/inference/agilex/inference/agilex_inference_openpi_temporal_smoothing.py \
-  --host <gpu_host_ip> --port 8000 --ctrl_type joint --use_temporal_smoothing --chunk_size 50
-```
-
-**B. CLI overrides (only if something subscribes/publishes on ROS 1 with those names)**  
-
-If you remap ROS 2 → ROS 1 via bridge under the **default** names, you do not need extra flags. If you run native ROS 2 inference in the future (`rclpy`), use:
-
-```bash
-python .../agilex_inference_openpi_temporal_smoothing.py \
-  --puppet_arm_left_topic /joint_left \
-  --puppet_arm_right_topic /joint_right \
-  --puppet_arm_left_cmd_topic /joint_ctrl_cmd_left \
-  --puppet_arm_right_cmd_topic /joint_ctrl_cmd_right \
-  ...
-```
-
-(Camera topics can be overridden with `--img_front_topic`, `--img_left_topic`, `--img_right_topic` if your RealSense namespaces differ.)
+Run the ROS 1 script in a terminal with **Noetic** sourced (not Humble).
 
 ---
 
@@ -319,8 +384,7 @@ python .../agilex_inference_openpi_temporal_smoothing.py \
 | 2 | `sudo bash ./can_config.sh` in `$PIPER_ROS2_ROOT` |
 | 3–5 | RealSense launches (`camera_f`, `camera_l`, `camera_r`) or one multi-camera launch |
 | 6 | `ros2 launch piper start_two_piper.launch.py ...` |
-| 7 | `ros1_bridge` (if using ROS 1 inference scripts) |
-| 8 | Inference Python script (`conda activate kai0_inference`) |
+| 7 | Inference: `agilex_inference_openpi_temporal_smoothing_ros2.py` (`conda activate kai0_inference`) |
 
 Log each pane optionally:
 
@@ -342,9 +406,16 @@ Set `PIPER_ROS2_ROOT`, `DEMO_ROOT`, and `LOG_DIR` to your paths.
 | `command not found: ros2` | Humble not sourced | `source /opt/ros/humble/setup.bash` |
 | `package 'piper' not found` | Workspace not built/sourced | `colcon build` && `source install/setup.bash` |
 | CAN / arm not responding | Wrong bitrate or names | Use **1000000**; names `can_left` / `can_right` must match launch args |
-| No camera topics | Namespace mismatch | Align RealSense `camera_namespace` with `/camera_f`, `/camera_l`, `/camera_r` |
-| Inference: no joint data | Topic / bridge mismatch | See [Inference topics](#inference-topics-ros-2--scripts); check `ros2 topic hz /joint_left` |
-| Mixed ROS errors | Noetic + Humble in one shell | Use separate terminals or bridge; avoid sourcing both distros in one process |
+| No camera topics | Namespace mismatch | Use `ros2 topic list`; with duplicate ns see `/camera_l/camera_l/color/image_raw` or pass `--img_*_topic` |
+| Inference: no joint data | Topics not publishing | `ros2 topic hz /joint_left`; ensure Piper launch is running |
+| `syn fail when get_ros_observation` | Camera or joint sync | Check all three color topics and `/joint_left` / `/joint_right` |
+| Arm does not move | Wrong `JointState.name` | Use `_ros2.py` (sends `joint1`…`gripper`); ROS 1 names break ROS 2 Piper |
+| `No module named 'piper_msgs'` | Workspace not sourced | `source "$PIPER_ROS2_ROOT/install/setup.bash"` before Python |
+| `_TYPE_SUPPORT` / ROS 1 message type | Stale `PYTHONPATH` from parent shell (e.g. `~/pika_ros` in `.bashrc`) | Use `run_inference_ros2.sh` (clears paths before sourcing Humble); or `unset PYTHONPATH AMENT_PREFIX_PATH` then source Humble + piper workspace |
+| Dry run: `syn fail` | No joint feedback | Run `mock_arm_feedback_ros2.py` or Piper for `/joint_left` / `/joint_right` |
+| `The passed message type is invalid` (echo) | Wrong type string or no publisher yet | Start `--dry_run` inference first; then `ros2 topic echo /joint_ctrl_cmd_left_dry` with no type, or try `sensor_msgs/JointState` |
+| Dry run: arm still moves | Piper + real cmd topics | Use `--dry_run`; confirm echo on `*_dry` topics, not `/joint_ctrl_cmd_left` |
+| Mixed ROS errors | Noetic + Humble in one shell | Inference terminal: Humble only; bridge (if any) in another terminal |
 
 ---
 
